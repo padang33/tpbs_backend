@@ -73,7 +73,7 @@ app.post("/Backend/api/signin", async (req, res) => {
 
       // reset attempts
       loginAttempts[user] = { count: 0, lastAttempt: Date.now() };
-      const accessToken  = jwt.sign({ userId: userRec.id }, JWT_SECRET, { expiresIn: '15m' });
+      const accessToken  = jwt.sign({ userId: userRec.id }, JWT_SECRET, { expiresIn: '7d' });
       const refreshToken = jwt.sign({ userId: userRec.id }, REFRESH_SECRET, { expiresIn: '7d' });
 
       // (ถ้าใช้ cookie) set cookies…
@@ -185,6 +185,41 @@ app.get('/Backend/api/users', (req, res) => {
     res.json(rows);
   });
 });
+
+
+// ใช้ชื่อ middleware ให้ตรงกับที่ประกาศไว้
+app.post(
+  "/Backend/api/logout",
+  authenticateToken,              // <-- เปลี่ยนจาก authenticateAccessToken
+  async (req, res) => {
+    try {
+      const userId = req.userId;  // <-- ได้มาจาก middleware แล้ว
+      // 1) รีเซ็ตตัวนับ loginAttempts ตาม key เป็น userId
+      delete loginAttempts[userId];
+
+      // 2) เพิกถอน (revoke) refresh token ในฐานข้อมูล
+      //    สมมติคุณมีตาราง refresh_tokens ที่เก็บ user_id กับ token
+      await pool
+        .promise()
+        .query("DELETE FROM refresh_tokens WHERE user_id = ?", [userId]);
+
+      // 3) ลบ cookie ถ้าเคย set ชื่อ refreshToken (path ต้องตรงกับที่ set ตอน login)
+      res.clearCookie("refreshToken", {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === "production",
+        sameSite: "strict",
+        path: "/Backend/api/refresh",
+      });
+
+      // 4) ส่งกลับ 204 No Content
+      return res.sendStatus(204);
+    } catch (err) {
+      console.error("Logout error:", err);
+      return res.status(500).json({ message: "Logout failed" });
+    }
+  }
+);
+
 
 const PORT = process.env.PORT||3000;
 app.listen(PORT,()=>log(`Server started on port ${PORT}`));
