@@ -812,6 +812,58 @@ app.get("/Backend/api/job", authenticateToken, async (req, res) => {
   }
 });
 
+app.post("/Backend/api/register-push-token", authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const { token } = req.body;
+
+  if (!token) return res.status(400).json({ message: "Missing token" });
+
+  try {
+    await pool.promise().query(
+      "UPDATE users SET push_token = ? WHERE id = ?",
+      [token, userId]
+    );
+    res.json({ message: "Token saved" });
+  } catch (err) {
+    console.error("❌ Token save error:", err);
+    res.status(500).json({ message: "Failed to save token" });
+  }
+});
+
+app.post("/Backend/api/test-push", authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+
+  try {
+    const [[{ push_token } = {}]] = await pool
+      .promise()
+      .query("SELECT push_token FROM users WHERE id = ?", [userId]);
+
+    if (!push_token) {
+      return res.status(400).json({ message: "ยังไม่มี push token ในระบบ" });
+    }
+
+    const { Expo } = require("expo-server-sdk");
+    const expo = new Expo();
+
+    const message = {
+      to: push_token,
+      sound: "default",
+      title: "🔔 ทดสอบแจ้งเตือน",
+      body: "Push นี้ส่งจากปุ่ม Test Push",
+      data: { test: true },
+    };
+
+    const result = await expo.sendPushNotificationsAsync([message]);
+    console.log("✅ Push result:", result);
+
+    res.json({ message: "ส่งแจ้งเตือนแล้ว", result });
+  } catch (err) {
+    console.error("❌ Push error:", err);
+    res.status(500).json({ message: "เกิดข้อผิดพลาดในการส่งแจ้งเตือน" });
+  }
+});
+
+
 const PORT = process.env.PORT || 3000;
 pool.getConnection((err, connection) => {
   if (err) {
