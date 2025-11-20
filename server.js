@@ -20,6 +20,7 @@ const saltRounds = 10;
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 const REFRESH_SECRET = process.env.REFRESH_SECRET || "your-refresh-secret-key";
 
+
 function log(...args) {
   const msg = args
     .map((a) => (typeof a === "string" ? a : JSON.stringify(a)))
@@ -217,7 +218,7 @@ app.post("/Backend/api/schedule", authenticateToken, (req, res) => {
                VALUES(?,?,?,?,?,?)`;
   pool.query(
     sql,
-    [localDate, title, detail, type, req.userId, related_user],
+    [localDate, title, detail, type, req.user.id, related_user],
     (err) =>
       err
         ? res.status(500).json({ message: "Insert error" })
@@ -231,7 +232,7 @@ app.put("/Backend/api/schedule/:id", authenticateToken, (req, res) => {
   const id = req.params.id;
   const sql = `UPDATE schedule SET title=?,detail=?,type=?,related_user=?,updated_by=?,updated_at=NOW()
                WHERE id=?`;
-  pool.query(sql, [title, detail, type, related_user, req.userId, id], (err) =>
+  pool.query(sql, [title, detail, type, related_user, req.user.id, id], (err) =>
     err
       ? res.status(500).json({ message: "Update error" })
       : res.json({ message: "Updated" })
@@ -254,6 +255,37 @@ const storage = multer.diskStorage({
   filename: (req, file, cb) => cb(null, file.originalname)
 });
 const upload = multer({ storage });
+
+// ==== Multer config for work chat uploads (images/files/videos) ====
+const chatStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    let baseDir = path.join(__dirname, "uploads", "work_chat");
+
+    if (file.mimetype && file.mimetype.startsWith("image/")) {
+      baseDir = path.join(baseDir, "images");
+    } else if (file.mimetype && file.mimetype.startsWith("video/")) {
+      baseDir = path.join(baseDir, "videos");
+    } else {
+      baseDir = path.join(baseDir, "files");
+    }
+
+    cb(null, baseDir);
+  },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname || "");
+    const name = path.basename(file.originalname || "file", ext);
+    const unique = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    cb(null, `${name}-${unique}${ext}`);
+  }
+});
+
+const uploadChat = multer({
+  storage: chatStorage,
+  limits: {
+    fileSize: 50 * 1024 * 1024 // 50MB ต่อไฟล์
+  }
+});
+
 
 // --- fetch current user ---
 app.get("/Backend/api/me", authenticateToken, (req, res) => {
@@ -417,6 +449,11 @@ app.post(
 app.use(
   "/Backend/UserImage",
   express.static(path.join(__dirname, "UserImage"))
+);
+
+app.use(
+  "/Backend/uploads/work_chat",
+  express.static(path.join(__dirname, "uploads", "work_chat"))
 );
 
 // API สำหรับส่ง URL ของรูปภาพ
@@ -730,6 +767,329 @@ app.post("/Backend/api/works", authenticateToken, async (req, res) => {
     conn.release();
   }
 });
+
+// ==== Helper: check that user belongs to this work (creator or in work_users) ====
+async function ensureUserInWork(workId, userId) {
+  const [rows] = await pool
+    .promise()
+    .query(
+      `SELECT 1
+       FROM works w
+       LEFT JOIN work_users wu ON wu.work_id = w.id
+       WHERE w.id = ?
+         AND (w.created_by = ? OR wu.user_id = ?)
+       LIMIT 1`,
+      [workId, userId, userId]
+    );
+  return rows.length > 0;
+}
+
+// ==== Work chat APIs ====
+
+// GET: โหลดข้อความแชทของงาน (มี pagination)
+app.get("/Backend/api/works/:workId/messages", authenticateToken, async (req, res) => {
+  const workId = parseInt(req.params.workId, 10);
+  const userId = req.user.id;
+  let { limit, beforeId } = req.query;
+
+  if (Number.isNaN(workId)) {
+    return res.status(400).json({ message: "Invalid work id" });
+  }
+
+  try {
+    const hasAccess = await ensureUserInWork(workId, userId);
+    if (!hasAccess) {
+      return res.status(403).json({ message: "คุณไม่มีสิทธิ์ในงานนี้" });
+    }
+  } catch (err) {
+    console.error("❌ ensureUserInWork error:", err);
+    return res.status(500).json({ message: "DB error" });
+  }
+
+  limit = parseInt(limit, 10) || 30;
+  if (limit > 100) limit = 100;
+  beforeId = beforeId ? parseInt(beforeId, 10) : null;
+
+  const conn = await pool.promise().getConnection();
+
+  try {
+    let where = "wm.work_id = ?";
+    const params = [workId];
+
+    if (beforeId) {
+      where += " AND wm.id < ?";
+      params.push(beforeId);
+    }
+
+    const sqlMessages = `
+      SELECT
+        wm.*,
+        u.firstname,
+        u.lastname,
+        u.imageUrl AS user_image
+      FROM work_messages wm
+      JOIN users u ON wm.user_id = u.id
+      WHERE ${where}
+      ORDER BY wm.id DESC
+      LIMIT ?
+    `;
+
+    const [msgRows] = await conn.query(sqlMessages, [...params, limit + 1]);
+    const hasMore = msgRows.length > limit;
+    const slice = msgRows.slice(0, limit);
+
+    if (!slice.length) {
+      return res.json({ messages: [], hasMore: false, nextBeforeId: null });
+    }
+
+    const msgIds = slice.map((m) => m.id);
+
+    const [imgRows] = await conn.query(
+      "SELECT * FROM work_message_images WHERE message_id IN (?)",
+      [msgIds]
+    );
+    const [fileRows] = await conn.query(
+      "SELECT * FROM work_message_files WHERE message_id IN (?)",
+      [msgIds]
+    );
+    const [videoRows] = await conn.query(
+      "SELECT * FROM work_message_videos WHERE message_id IN (?)",
+      [msgIds]
+    );
+
+    const msgMap = {};
+    for (const row of slice) {
+      msgMap[row.id] = {
+        id: row.id,
+        work_id: row.work_id,
+        user_id: row.user_id,
+        type: row.type,
+        message: row.message,
+        is_edited: !!row.is_edited,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        user: {
+          id: row.user_id,
+          firstname: row.firstname,
+          lastname: row.lastname,
+          imageUrl: row.user_image
+        },
+        images: [],
+        files: [],
+        video: null
+      };
+    }
+
+    for (const img of imgRows) {
+      if (msgMap[img.message_id]) {
+        msgMap[img.message_id].images.push({
+          id: img.id,
+          url: img.image_url,
+          width: img.width,
+          height: img.height
+        });
+      }
+    }
+
+    for (const f of fileRows) {
+      if (msgMap[f.message_id]) {
+        msgMap[f.message_id].files.push({
+          id: f.id,
+          url: f.file_url,
+          name: f.file_name,
+          size: f.file_size,
+          mime_type: f.mime_type
+        });
+      }
+    }
+
+    for (const v of videoRows) {
+      if (msgMap[v.message_id]) {
+        msgMap[v.message_id].video = {
+          id: v.id,
+          url: v.video_url,
+          thumbnail_url: v.thumbnail_url,
+          duration: v.duration,
+          width: v.width,
+          height: v.height
+        };
+      }
+    }
+
+    const messages = slice.map((m) => msgMap[m.id]);
+    const nextBeforeId = hasMore ? messages[messages.length - 1].id : null;
+
+    res.json({ messages, hasMore, nextBeforeId });
+  } catch (err) {
+    console.error("❌ GET work messages error:", err);
+    res.status(500).json({ message: "DB error" });
+  } finally {
+    conn.release();
+  }
+});
+
+// POST: ส่งข้อความแชท (text / image / file / video)
+app.post(
+  "/Backend/api/works/:workId/messages",
+  authenticateToken,
+  uploadChat.fields([
+    { name: "images", maxCount: 10 },
+    { name: "files", maxCount: 10 },
+    { name: "video", maxCount: 1 }
+  ]),
+  async (req, res) => {
+    const workId = parseInt(req.params.workId, 10);
+    const userId = req.user.id;
+    let { type, message } = req.body;
+
+    if (Number.isNaN(workId)) {
+      return res.status(400).json({ message: "Invalid work id" });
+    }
+
+    type = (type || "").toLowerCase();
+    if (!["text", "image", "file", "video"].includes(type)) {
+      return res.status(400).json({ message: "Invalid type" });
+    }
+
+    try {
+      const hasAccess = await ensureUserInWork(workId, userId);
+      if (!hasAccess) {
+        return res.status(403).json({ message: "คุณไม่มีสิทธิ์ในงานนี้" });
+      }
+    } catch (err) {
+      console.error("❌ ensureUserInWork error:", err);
+      return res.status(500).json({ message: "DB error" });
+    }
+
+    const images = (req.files && req.files["images"]) || [];
+    const files = (req.files && req.files["files"]) || [];
+    const videoFiles = (req.files && req.files["video"]) || [];
+
+    if (type === "text") {
+      if (!message || !message.trim()) {
+        return res.status(400).json({ message: "ข้อความว่าง" });
+      }
+    } else if (type === "image" && !images.length) {
+      return res.status(400).json({ message: "ต้องมีรูปอย่างน้อย 1 รูป" });
+    } else if (type === "file" && !files.length) {
+      return res.status(400).json({ message: "ต้องมีไฟล์อย่างน้อย 1 ไฟล์" });
+    } else if (type === "video" && !videoFiles.length) {
+      return res.status(400).json({ message: "ต้องมีไฟล์วิดีโอ" });
+    }
+
+    const conn = await pool.promise().getConnection();
+
+    try {
+      await conn.beginTransaction();
+
+      const [result] = await conn.query(
+        "INSERT INTO work_messages (work_id, user_id, type, message, is_edited, created_at) VALUES (?, ?, ?, ?, 0, UTC_TIMESTAMP())",
+        [workId, userId, type, message || null]
+      );
+      const msgId = result.insertId;
+
+      for (const img of images) {
+        const imageUrl = `https://himtang.com/Backend/uploads/work_chat/images/${img.filename}`;
+        await conn.query(
+          "INSERT INTO work_message_images (message_id, image_url, width, height) VALUES (?, ?, NULL, NULL)",
+          [msgId, imageUrl]
+        );
+      }
+
+      for (const f of files) {
+        const fileUrl = `https://himtang.com/Backend/uploads/work_chat/files/${f.filename}`;
+        await conn.query(
+          "INSERT INTO work_message_files (message_id, file_url, file_name, file_size, mime_type) VALUES (?, ?, ?, ?, ?)",
+          [msgId, fileUrl, f.originalname, f.size, f.mimetype]
+        );
+      }
+
+      if (videoFiles.length) {
+        const v = videoFiles[0];
+        const videoUrl = `https://himtang.com/Backend/uploads/work_chat/videos/${v.filename}`;
+        await conn.query(
+          "INSERT INTO work_message_videos (message_id, video_url, thumbnail_url, duration, width, height) VALUES (?, ?, ?, NULL, NULL, NULL)",
+          [msgId, videoUrl, ""]
+        );
+      }
+
+      await conn.commit();
+
+      const [rows] = await conn.query(
+        `SELECT wm.*, u.firstname, u.lastname, u.imageUrl AS user_image
+         FROM work_messages wm
+         JOIN users u ON wm.user_id = u.id
+         WHERE wm.id = ?`,
+        [msgId]
+      );
+      const base = rows[0];
+
+      const [imgRows] = await conn.query(
+        "SELECT * FROM work_message_images WHERE message_id = ?",
+        [msgId]
+      );
+      const [fileRows] = await conn.query(
+        "SELECT * FROM work_message_files WHERE message_id = ?",
+        [msgId]
+      );
+      const [videoRows] = await conn.query(
+        "SELECT * FROM work_message_videos WHERE message_id = ?",
+        [msgId]
+      );
+
+      const messageObj = {
+        id: base.id,
+        work_id: base.work_id,
+        user_id: base.user_id,
+        type: base.type,
+        message: base.message,
+        is_edited: !!base.is_edited,
+        created_at: base.created_at,
+        updated_at: base.updated_at,
+        user: {
+          id: base.user_id,
+          firstname: base.firstname,
+          lastname: base.lastname,
+          imageUrl: base.user_image
+        },
+        images: imgRows.map((img) => ({
+          id: img.id,
+          url: img.image_url,
+          width: img.width,
+          height: img.height
+        })),
+        files: fileRows.map((f) => ({
+          id: f.id,
+          url: f.file_url,
+          name: f.file_name,
+          size: f.file_size,
+          mime_type: f.mime_type
+        })),
+        video: videoRows.length
+          ? {
+              id: videoRows[0].id,
+              url: videoRows[0].video_url,
+              thumbnail_url: videoRows[0].thumbnail_url,
+              duration: videoRows[0].duration,
+              width: videoRows[0].width,
+              height: videoRows[0].height
+            }
+          : null
+      };
+
+      // TODO: ภายหลังจะ broadcast ผ่าน Socket.IO: io.to("work:" + workId).emit("message_new", messageObj);
+
+      res.status(201).json({ message: messageObj });
+    } catch (err) {
+      await conn.rollback();
+      console.error("❌ POST work message error:", err);
+      res.status(500).json({ message: "DB error" });
+    } finally {
+      conn.release();
+    }
+  }
+);
+
 
 app.get("/Backend/api/job", authenticateToken, async (req, res) => {
   const userId = req.user.id;
