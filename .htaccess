@@ -1,0 +1,12 @@
+RewriteEngine On
+
+# Proxy WebSocket ไปยัง Node.js
+RewriteCond %{HTTP:Upgrade} =websocket [NC]
+RewriteCond %{HTTP:Connection} upgrade [NC]
+RewriteRule ^socket.io/(.*) ws://127.0.0.1/Backend/socket.io/$1 [P,L]
+
+# Proxy HTTP polling (สำรอง)
+RewriteRule ^socket.io/(.*) http://127.0.0.1/Backend/socket.io/$1 [P,L]
+
+# อนุญาต proxy
+ProxyPassReverse /socket.io/ http://127.0.0.1/Backend/socket.io/

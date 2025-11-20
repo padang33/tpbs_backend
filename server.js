@@ -8,17 +8,36 @@ const cookieParser = require("cookie-parser");
 const { body, validationResult } = require("express-validator");
 const path = require("path");
 const multer = require("multer");
+const fs = require("fs");
 
 require("dotenv").config();
+
+const http = require("http");
+const { Server } = require("socket.io");
 
 const loginAttempts = {};
 const MAX_ATTEMPTS = 3;
 const LOCK_TIME = 30 * 60 * 1000;
 
-const app = express();
+
 const saltRounds = 10;
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 const REFRESH_SECRET = process.env.REFRESH_SECRET || "your-refresh-secret-key";
+
+const app = express();
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  path: "/Backend/socket.io", 
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"],
+    credentials: true
+  }
+});
+
+// เก็บ io ลงใน app เผื่อใช้ใน route ต่าง ๆ
+app.set("io", io);
 
 
 function log(...args) {
@@ -470,7 +489,7 @@ app.get("/Backend/api/user-image/:filename", (req, res) => {
   res.json({ url: imageUrl });
 });
 
-app.get("/Backend/api/job", authenticateToken, (req, res) => {
+/*app.get("/Backend/api/job", authenticateToken, (req, res) => {
   const userId = req.user.id;
   const { year, month } = req.query;
 
@@ -569,7 +588,7 @@ app.get("/Backend/api/job", authenticateToken, (req, res) => {
 
     res.json(output);
   });
-});
+});*/
 
 app.post("/Backend/api/job", authenticateToken, (req, res) => {
   const { date, center, shifts } = req.body;
@@ -783,6 +802,106 @@ async function ensureUserInWork(workId, userId) {
     );
   return rows.length > 0;
 }
+
+// ==== Helper: ลบไฟล์จริงจากดิสก์ โดยใช้ URL ที่เก็บใน DB ====
+function deletePhysicalFileByUrl(fileUrl) {
+  if (!fileUrl) return;
+
+  try {
+    // ตัด query string ทิ้ง (กันกรณีมี ?something)
+    const cleanUrl = fileUrl.split("?")[0];
+
+    let subDir = "";
+    if (cleanUrl.includes("/images/")) subDir = "images";
+    else if (cleanUrl.includes("/files/")) subDir = "files";
+    else if (cleanUrl.includes("/videos/")) subDir = "videos";
+
+    if (!subDir) return;
+
+    const filename = path.basename(cleanUrl);
+    const fullPath = path.join(
+      __dirname,
+      "uploads",
+      "work_chat",
+      subDir,
+      filename
+    );
+
+    fs.unlink(fullPath, (err) => {
+      if (err && err.code !== "ENOENT") {
+        console.error("⚠️ ลบไฟล์ไม่สำเร็จ:", fullPath, err.message);
+      } else if (!err) {
+        console.log("🗑 ลบไฟล์สำเร็จ:", fullPath);
+      }
+    });
+  } catch (e) {
+    console.error("deletePhysicalFileByUrl error:", e);
+  }
+}
+
+
+// ==== Socket.IO auth & events ====
+io.use((socket, next) => {
+  try {
+    // เอา token จาก handshake.auth.token (ฝั่ง React Native ส่งมาแบบนี้)
+    const authToken = socket.handshake.auth?.token;
+    // สำรอง: ถ้าอยากส่งแบบ header: "Authorization: Bearer <token>"
+    const authHeader = socket.handshake.headers?.authorization || "";
+    const headerToken = authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7)
+      : null;
+
+    const token = authToken || headerToken;
+    if (!token) {
+      return next(new Error("Unauthorized"));
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    socket.data.userId = decoded.userId;
+    next();
+  } catch (err) {
+    console.error("❌ Socket auth error:", err.message);
+    next(new Error("Unauthorized"));
+  }
+});
+
+io.on("connection", (socket) => {
+  const userId = socket.data.userId;
+  log("🔌 Socket connected", { userId, socketId: socket.id });
+
+  // เข้าห้องตาม workId
+  socket.on("join_work", async (workId) => {
+    try {
+      const wid = parseInt(workId, 10);
+      if (Number.isNaN(wid)) return;
+
+      const hasAccess = await ensureUserInWork(wid, userId);
+      if (!hasAccess) {
+        log("🚫 join_work denied", { userId, workId: wid });
+        return;
+      }
+
+      const roomName = `work:${wid}`;
+      socket.join(roomName);
+      log("✅ join_work", { userId, roomName });
+    } catch (err) {
+      console.error("❌ join_work error:", err);
+    }
+  });
+
+  socket.on("leave_work", (workId) => {
+    const wid = parseInt(workId, 10);
+    if (Number.isNaN(wid)) return;
+
+    const roomName = `work:${wid}`;
+    socket.leave(roomName);
+    log("👋 leave_work", { userId, roomName });
+  });
+
+  socket.on("disconnect", () => {
+    log("🔌 Socket disconnected", { userId, socketId: socket.id });
+  });
+});
 
 // ==== Work chat APIs ====
 
@@ -1077,7 +1196,11 @@ app.post(
           : null
       };
 
-      // TODO: ภายหลังจะ broadcast ผ่าน Socket.IO: io.to("work:" + workId).emit("message_new", messageObj);
+      // 🔔 Broadcast realtime ไปหาทุกคนที่อยู่ในห้องของงานนี้
+      const io = req.app.get("io");
+      if (io) {
+        io.to(`work:${workId}`).emit("work:message:new", messageObj);
+      }
 
       res.status(201).json({ message: messageObj });
     } catch (err) {
@@ -1223,6 +1346,241 @@ app.post("/Backend/api/test-push", authenticateToken, async (req, res) => {
   }
 });
 
+// PUT: แก้ไขข้อความ (เฉพาะ owner และ type = text)
+app.put(
+  "/Backend/api/works/:workId/messages/:messageId",
+  authenticateToken,
+  async (req, res) => {
+    const workId = parseInt(req.params.workId, 10);
+    const messageId = parseInt(req.params.messageId, 10);
+    const userId = req.user.id;
+    const { message } = req.body || {};
+
+    if (Number.isNaN(workId) || Number.isNaN(messageId)) {
+      return res.status(400).json({ message: "Invalid id" });
+    }
+
+    const newText = (message || "").trim();
+    if (!newText) {
+      return res.status(400).json({ message: "ข้อความว่าง" });
+    }
+
+    const conn = await pool.promise().getConnection();
+    try {
+      await conn.beginTransaction();
+
+      // ดึง message เดิมมาก่อน
+      const [rows] = await conn.query(
+        "SELECT * FROM work_messages WHERE id = ? AND work_id = ?",
+        [messageId, workId]
+      );
+
+      if (!rows.length) {
+        await conn.rollback();
+        return res.status(404).json({ message: "ไม่พบข้อความ" });
+      }
+
+      const msg = rows[0];
+
+      // เช็คว่าเป็นของ user นี้จริงไหม
+      if (msg.user_id !== userId) {
+        await conn.rollback();
+        return res.status(403).json({ message: "คุณไม่มีสิทธิ์แก้ไขข้อความนี้" });
+      }
+
+      // แก้ไขได้เฉพาะข้อความ type = text
+      if (msg.type !== "text") {
+        await conn.rollback();
+        return res
+          .status(400)
+          .json({ message: "แก้ไขได้เฉพาะข้อความตัวหนังสือเท่านั้น" });
+      }
+
+      // อัปเดตข้อความ
+      await conn.query(
+        "UPDATE work_messages SET message = ?, is_edited = 1, updated_at = UTC_TIMESTAMP() WHERE id = ?",
+        [newText, messageId]
+      );
+
+      // โหลด message + user ใหม่
+      const [baseRows] = await conn.query(
+        `SELECT wm.*, u.firstname, u.lastname, u.imageUrl AS user_image
+         FROM work_messages wm
+         JOIN users u ON wm.user_id = u.id
+         WHERE wm.id = ?`,
+        [messageId]
+      );
+      const base = baseRows[0];
+
+      const [imgRows] = await conn.query(
+        "SELECT * FROM work_message_images WHERE message_id = ?",
+        [messageId]
+      );
+      const [fileRows] = await conn.query(
+        "SELECT * FROM work_message_files WHERE message_id = ?",
+        [messageId]
+      );
+      const [videoRows] = await conn.query(
+        "SELECT * FROM work_message_videos WHERE message_id = ?",
+        [messageId]
+      );
+
+      const messageObj = {
+        id: base.id,
+        work_id: base.work_id,
+        user_id: base.user_id,
+        type: base.type,
+        message: base.message,
+        is_edited: !!base.is_edited,
+        created_at: base.created_at,
+        updated_at: base.updated_at,
+        user: {
+          id: base.user_id,
+          firstname: base.firstname,
+          lastname: base.lastname,
+          imageUrl: base.user_image
+        },
+        images: imgRows.map((img) => ({
+          id: img.id,
+          url: img.image_url,
+          width: img.width,
+          height: img.height
+        })),
+        files: fileRows.map((f) => ({
+          id: f.id,
+          url: f.file_url,
+          name: f.file_name,
+          size: f.file_size,
+          mime_type: f.mime_type
+        })),
+        video: videoRows.length
+          ? {
+              id: videoRows[0].id,
+              url: videoRows[0].video_url,
+              thumbnail_url: videoRows[0].thumbnail_url,
+              duration: videoRows[0].duration,
+              width: videoRows[0].width,
+              height: videoRows[0].height
+            }
+          : null
+      };
+
+      await conn.commit();
+
+      // broadcast edit เผื่อจะใช้ทีหลัง
+      const io = req.app.get("io");
+      if (io) {
+        io.to(`work:${workId}`).emit("work:message:update", messageObj);
+      }
+
+      // ฟรอนต์ตอนนี้ใช้ data.message
+      return res.json({ message: messageObj });
+    } catch (err) {
+      await conn.rollback();
+      console.error("❌ PUT work message error:", err);
+      return res.status(500).json({ message: "DB error" });
+    } finally {
+      conn.release();
+    }
+  }
+);
+
+// DELETE: ลบข้อความ (เฉพาะ owner) + ลบไฟล์จริงออกจากดิสก์
+app.delete(
+  "/Backend/api/works/:workId/messages/:messageId",
+  authenticateToken,
+  async (req, res) => {
+    const workId = parseInt(req.params.workId, 10);
+    const messageId = parseInt(req.params.messageId, 10);
+    const userId = req.user.id;
+
+    if (Number.isNaN(workId) || Number.isNaN(messageId)) {
+      return res.status(400).json({ message: "Invalid id" });
+    }
+
+    const conn = await pool.promise().getConnection();
+    try {
+      await conn.beginTransaction();
+
+      // 1) โหลด message ก่อน
+      const [rows] = await conn.query(
+        "SELECT * FROM work_messages WHERE id = ? AND work_id = ?",
+        [messageId, workId]
+      );
+
+      if (!rows.length) {
+        await conn.rollback();
+        return res.status(404).json({ message: "ไม่พบข้อความ" });
+      }
+
+      const msg = rows[0];
+
+      if (msg.user_id !== userId) {
+        await conn.rollback();
+        return res
+          .status(403)
+          .json({ message: "คุณไม่มีสิทธิ์ลบข้อความนี้" });
+      }
+
+      // 2) โหลด URL ของไฟล์แนบทั้งหมด
+      const [imgRows] = await conn.query(
+        "SELECT image_url FROM work_message_images WHERE message_id = ?",
+        [messageId]
+      );
+      const [fileRows] = await conn.query(
+        "SELECT file_url FROM work_message_files WHERE message_id = ?",
+        [messageId]
+      );
+      const [videoRows] = await conn.query(
+        "SELECT video_url FROM work_message_videos WHERE message_id = ?",
+        [messageId]
+      );
+
+      // 3) ลบ row ในตารางไฟล์แนบ
+      await conn.query(
+        "DELETE FROM work_message_images WHERE message_id = ?",
+        [messageId]
+      );
+      await conn.query(
+        "DELETE FROM work_message_files WHERE message_id = ?",
+        [messageId]
+      );
+      await conn.query(
+        "DELETE FROM work_message_videos WHERE message_id = ?",
+        [messageId]
+      );
+
+      // 4) ลบ message หลัก
+      await conn.query("DELETE FROM work_messages WHERE id = ?", [messageId]);
+
+      await conn.commit();
+
+      // 5) ลบไฟล์จริงจากดิสก์ (อยู่นอก transaction ก็ได้)
+      imgRows.forEach((r) => deletePhysicalFileByUrl(r.image_url));
+      fileRows.forEach((r) => deletePhysicalFileByUrl(r.file_url));
+      videoRows.forEach((r) => deletePhysicalFileByUrl(r.video_url));
+
+      const io = req.app.get("io");
+      if (io) {
+        io.to(`work:${workId}`).emit("work:message:delete", {
+          id: messageId,
+          work_id: workId
+        });
+      }
+
+      return res.sendStatus(204);
+    } catch (err) {
+      await conn.rollback();
+      console.error("❌ DELETE work message error:", err);
+      return res.status(500).json({ message: "DB error" });
+    } finally {
+      conn.release();
+    }
+  }
+);
+
+
+
 
 const PORT = process.env.PORT || 3000;
 pool.getConnection((err, connection) => {
@@ -1234,8 +1592,8 @@ pool.getConnection((err, connection) => {
     connection.release();
 
     // ถ้าเชื่อม DB สำเร็จ จึงเริ่มฟังพอร์ต
-    app.listen(PORT, () => {
-      log(`Server started on port ${PORT}`);
+    server.listen(PORT, () => {
+      log(`Server + Socket.IO started on port ${PORT}`);
     });
   }
 });
