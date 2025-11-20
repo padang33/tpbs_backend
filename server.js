@@ -790,12 +790,12 @@ async function ensureUserInWork(workId, userId) {
 app.get("/Backend/api/works/:workId/messages", authenticateToken, async (req, res) => {
   const workId = parseInt(req.params.workId, 10);
   const userId = req.user.id;
-  let { limit, beforeId } = req.query;
 
   if (Number.isNaN(workId)) {
     return res.status(400).json({ message: "Invalid work id" });
   }
 
+  // --- เช็คสิทธิ์ก่อนเหมือนเดิม ---
   try {
     const hasAccess = await ensureUserInWork(workId, userId);
     if (!hasAccess) {
@@ -806,21 +806,10 @@ app.get("/Backend/api/works/:workId/messages", authenticateToken, async (req, re
     return res.status(500).json({ message: "DB error" });
   }
 
-  limit = parseInt(limit, 10) || 30;
-  if (limit > 100) limit = 100;
-  beforeId = beforeId ? parseInt(beforeId, 10) : null;
-
   const conn = await pool.promise().getConnection();
 
   try {
-    let where = "wm.work_id = ?";
-    const params = [workId];
-
-    if (beforeId) {
-      where += " AND wm.id < ?";
-      params.push(beforeId);
-    }
-
+    // ---- ดึงทุกข้อความในงานนี้ (ไม่มี LIMIT / beforeId แล้ว) ----
     const sqlMessages = `
       SELECT
         wm.*,
@@ -829,21 +818,19 @@ app.get("/Backend/api/works/:workId/messages", authenticateToken, async (req, re
         u.imageUrl AS user_image
       FROM work_messages wm
       JOIN users u ON wm.user_id = u.id
-      WHERE ${where}
+      WHERE wm.work_id = ?
       ORDER BY wm.id DESC
-      LIMIT ?
     `;
 
-    const [msgRows] = await conn.query(sqlMessages, [...params, limit + 1]);
-    const hasMore = msgRows.length > limit;
-    const slice = msgRows.slice(0, limit);
+    const [msgRows] = await conn.query(sqlMessages, [workId]);
 
-    if (!slice.length) {
-      return res.json({ messages: [], hasMore: false, nextBeforeId: null });
+    if (!msgRows.length) {
+      return res.json({ messages: [] });
     }
 
-    const msgIds = slice.map((m) => m.id);
+    const msgIds = msgRows.map((m) => m.id);
 
+    // ---- โหลด images / files / videos ของ message เหล่านี้ ----
     const [imgRows] = await conn.query(
       "SELECT * FROM work_message_images WHERE message_id IN (?)",
       [msgIds]
@@ -857,8 +844,9 @@ app.get("/Backend/api/works/:workId/messages", authenticateToken, async (req, re
       [msgIds]
     );
 
+    // map รวมผล
     const msgMap = {};
-    for (const row of slice) {
+    for (const row of msgRows) {
       msgMap[row.id] = {
         id: row.id,
         work_id: row.work_id,
@@ -916,10 +904,10 @@ app.get("/Backend/api/works/:workId/messages", authenticateToken, async (req, re
       }
     }
 
-    const messages = slice.map((m) => msgMap[m.id]);
-    const nextBeforeId = hasMore ? messages[messages.length - 1].id : null;
+    const messages = msgRows.map((m) => msgMap[m.id]);
 
-    res.json({ messages, hasMore, nextBeforeId });
+    // ---- ไม่ต้อง hasMore / nextBeforeId แล้ว ----
+    res.json({ messages });
   } catch (err) {
     console.error("❌ GET work messages error:", err);
     res.status(500).json({ message: "DB error" });
@@ -927,6 +915,7 @@ app.get("/Backend/api/works/:workId/messages", authenticateToken, async (req, re
     conn.release();
   }
 });
+
 
 // POST: ส่งข้อความแชท (text / image / file / video)
 app.post(
@@ -1091,7 +1080,7 @@ app.post(
 );
 
 
-app.get("/Backend/api/job", authenticateToken, async (req, res) => {
+/*app.get("/Backend/api/job", authenticateToken, async (req, res) => {
   const userId = req.user.id;
   const { year, month } = req.query;
 
@@ -1170,7 +1159,7 @@ app.get("/Backend/api/job", authenticateToken, async (req, res) => {
     console.error("❌ job API error:", err);
     res.status(500).json({ message: "DB error" });
   }
-});
+});*/
 
 app.post("/Backend/api/register-push-token", authenticateToken, async (req, res) => {
   const userId = req.user.id;
@@ -1222,6 +1211,188 @@ app.post("/Backend/api/test-push", authenticateToken, async (req, res) => {
     res.status(500).json({ message: "เกิดข้อผิดพลาดในการส่งแจ้งเตือน" });
   }
 });
+
+// PUT: แก้ไขข้อความ (เฉพาะข้อความ type="text" และเจ้าของข้อความเท่านั้น)
+app.put(
+  "/Backend/api/works/:workId/messages/:messageId",
+  authenticateToken,
+  async (req, res) => {
+    const workId = parseInt(req.params.workId, 10);
+    const messageId = parseInt(req.params.messageId, 10);
+    const userId = req.user.id;
+    const { message } = req.body;
+
+    if (Number.isNaN(workId) || Number.isNaN(messageId)) {
+      return res.status(400).json({ message: "Invalid id" });
+    }
+    if (!message || !message.trim()) {
+      return res.status(400).json({ message: "ข้อความว่าง" });
+    }
+
+    const conn = await pool.promise().getConnection();
+    try {
+      // ตรวจสอบว่าข้อความนี้เป็นของ user นี้ และเป็นงานที่ user มีสิทธิ์
+      const [rows] = await conn.query(
+        `SELECT wm.*, w.created_by
+         FROM work_messages wm
+         JOIN works w ON wm.work_id = w.id
+         WHERE wm.id = ? AND wm.work_id = ?`,
+        [messageId, workId]
+      );
+
+      if (!rows.length) {
+        return res.status(404).json({ message: "ไม่พบข้อความ" });
+      }
+
+      const msg = rows[0];
+      if (msg.user_id !== userId) {
+        return res.status(403).json({ message: "คุณไม่มีสิทธิ์แก้ไขข้อความนี้" });
+      }
+      if (msg.type !== "text") {
+        return res
+          .status(400)
+          .json({ message: "อนุญาตให้แก้ไขได้เฉพาะข้อความตัวอักษรเท่านั้น" });
+      }
+
+      await conn.query(
+        `UPDATE work_messages
+         SET message = ?, is_edited = 1, updated_at = UTC_TIMESTAMP()
+         WHERE id = ?`,
+        [message.trim(), messageId]
+      );
+
+      // ดึงข้อมูลข้อความที่อัปเดตแล้วกลับไปในรูปแบบเดียวกับตอน POST
+      const [baseRows] = await conn.query(
+        `SELECT wm.*, u.firstname, u.lastname, u.imageUrl AS user_image
+         FROM work_messages wm
+         JOIN users u ON wm.user_id = u.id
+         WHERE wm.id = ?`,
+        [messageId]
+      );
+      const base = baseRows[0];
+
+      const [imgRows] = await conn.query(
+        "SELECT * FROM work_message_images WHERE message_id = ?",
+        [messageId]
+      );
+      const [fileRows] = await conn.query(
+        "SELECT * FROM work_message_files WHERE message_id = ?",
+        [messageId]
+      );
+      const [videoRows] = await conn.query(
+        "SELECT * FROM work_message_videos WHERE message_id = ?",
+        [messageId]
+      );
+
+      const messageObj = {
+        id: base.id,
+        work_id: base.work_id,
+        user_id: base.user_id,
+        type: base.type,
+        message: base.message,
+        is_edited: !!base.is_edited,
+        created_at: base.created_at,
+        updated_at: base.updated_at,
+        user: {
+          id: base.user_id,
+          firstname: base.firstname,
+          lastname: base.lastname,
+          imageUrl: base.user_image
+        },
+        images: imgRows.map((img) => ({
+          id: img.id,
+          url: img.image_url,
+          width: img.width,
+          height: img.height
+        })),
+        files: fileRows.map((f) => ({
+          id: f.id,
+          url: f.file_url,
+          name: f.file_name,
+          size: f.file_size,
+          mime_type: f.mime_type
+        })),
+        video: videoRows.length
+          ? {
+              id: videoRows[0].id,
+              url: videoRows[0].video_url,
+              thumbnail_url: videoRows[0].thumbnail_url,
+              duration: videoRows[0].duration,
+              width: videoRows[0].width,
+              height: videoRows[0].height
+            }
+          : null
+      };
+
+      res.json({ message: messageObj });
+    } catch (err) {
+      console.error("❌ PUT work message error:", err);
+      res.status(500).json({ message: "DB error" });
+    } finally {
+      conn.release();
+    }
+  }
+);
+
+// DELETE: ลบข้อความ (เฉพาะเจ้าของข้อความเท่านั้น)
+app.delete(
+  "/Backend/api/works/:workId/messages/:messageId",
+  authenticateToken,
+  async (req, res) => {
+    const workId = parseInt(req.params.workId, 10);
+    const messageId = parseInt(req.params.messageId, 10);
+    const userId = req.user.id;
+
+    if (Number.isNaN(workId) || Number.isNaN(messageId)) {
+      return res.status(400).json({ message: "Invalid id" });
+    }
+
+    const conn = await pool.promise().getConnection();
+    try {
+      const [rows] = await conn.query(
+        `SELECT wm.*, w.created_by
+         FROM work_messages wm
+         JOIN works w ON wm.work_id = w.id
+         WHERE wm.id = ? AND wm.work_id = ?`,
+        [messageId, workId]
+      );
+
+      if (!rows.length) {
+        return res.status(404).json({ message: "ไม่พบข้อความ" });
+      }
+
+      const msg = rows[0];
+      if (msg.user_id !== userId) {
+        return res.status(403).json({ message: "คุณไม่มีสิทธิ์ลบข้อความนี้" });
+      }
+
+      // ลบ attachments ก่อน (ถ้ามี)
+      await conn.query(
+        "DELETE FROM work_message_images WHERE message_id = ?",
+        [messageId]
+      );
+      await conn.query(
+        "DELETE FROM work_message_files WHERE message_id = ?",
+        [messageId]
+      );
+      await conn.query(
+        "DELETE FROM work_message_videos WHERE message_id = ?",
+        [messageId]
+      );
+
+      // ลบตัวข้อความ
+      await conn.query("DELETE FROM work_messages WHERE id = ?", [messageId]);
+
+      return res.sendStatus(204);
+    } catch (err) {
+      console.error("❌ DELETE work message error:", err);
+      res.status(500).json({ message: "DB error" });
+    } finally {
+      conn.release();
+    }
+  }
+);
+
 
 
 const PORT = process.env.PORT || 3000;
