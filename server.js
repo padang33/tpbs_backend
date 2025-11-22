@@ -19,7 +19,7 @@ const app = express();
 const saltRounds = 10;
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 const REFRESH_SECRET = process.env.REFRESH_SECRET || "your-refresh-secret-key";
-
+const fs = require("fs");
 
 function log(...args) {
   const msg = args
@@ -279,6 +279,8 @@ const chatStorage = multer.diskStorage({
   }
 });
 
+
+
 const uploadChat = multer({
   storage: chatStorage,
   limits: {
@@ -451,10 +453,44 @@ app.use(
   express.static(path.join(__dirname, "UserImage"))
 );
 
+// แชทงาน
 app.use(
   "/Backend/uploads/work_chat",
   express.static(path.join(__dirname, "uploads", "work_chat"))
 );
+
+// ปกงาน
+app.use(
+  "/Backend/uploads/work_covers",
+  express.static(path.join(__dirname, "uploads", "work_covers"))
+);
+
+// เสิร์ฟไฟล์ปกงานแบบตรง ๆ รองรับทั้งไฟล์เก่า/ใหม่
+app.get("/Backend/uploads/work_covers/:filename", (req, res) => {
+  const filename = req.params.filename;
+  const dir = path.join(__dirname, "uploads", "work_covers");
+
+  // 1) ลองชื่อเต็มก่อน (กรณีไฟล์ใหม่มีนามสกุล)
+  let filePath = path.join(dir, filename);
+  if (fs.existsSync(filePath)) {
+    return res.sendFile(filePath);
+  }
+
+  // 2) ถ้าไม่เจอ และชื่อมีจุด → ลองตัดนามสกุล (กรณีไฟล์เก่าที่ไม่มี .jpg/.png)
+  const dot = filename.lastIndexOf(".");
+  if (dot !== -1) {
+    const noExt = filename.slice(0, dot);
+    const altPath = path.join(dir, noExt);
+    if (fs.existsSync(altPath)) {
+      // บอก browser ว่าเป็นรูป
+      res.type("image/jpeg");
+      return res.sendFile(altPath);
+    }
+  }
+
+  return res.status(404).send("work_covers file not found");
+});
+
 
 // API สำหรับส่ง URL ของรูปภาพ
 app.get("/Backend/api/user-image/:filename", (req, res) => {
@@ -470,15 +506,34 @@ app.get("/Backend/api/user-image/:filename", (req, res) => {
   res.json({ url: imageUrl });
 });
 
-app.get("/Backend/api/job", authenticateToken, (req, res) => {
+// ดึงตารางกะ + งาน (works) มาทำเป็นรายวัน ให้ Calendar ใช้
+app.get("/Backend/api/job", authenticateToken, async (req, res) => {
   const userId = req.user.id;
   const { year, month } = req.query;
 
+  // format date เป็น YYYY-MM-DD
   function formatDate(dateObj) {
     const y = dateObj.getFullYear();
     const m = String(dateObj.getMonth() + 1).padStart(2, "0");
     const d = String(dateObj.getDate()).padStart(2, "0");
     return `${y}-${m}-${d}`;
+  }
+
+  // แปลงช่วง start_date/end_date -> list รายวัน
+  function expandDateRange(startStr, endStr) {
+    if (!startStr || !endStr) return [];
+    const out = [];
+    let cur = new Date(startStr);
+    const end = new Date(endStr);
+
+    // ป้องกัน loop เพี้ยนกรณีวันที่ผิด
+    if (isNaN(cur.getTime()) || isNaN(end.getTime())) return out;
+
+    while (cur <= end) {
+      out.push(formatDate(cur));
+      cur.setDate(cur.getDate() + 1);
+    }
+    return out;
   }
 
   if (!year || !month) {
@@ -487,88 +542,146 @@ app.get("/Backend/api/job", authenticateToken, (req, res) => {
 
   const paddedMonth = String(month).padStart(2, "0");
   const start = `${year}-${paddedMonth}-01`;
-  const endDate = new Date(year, parseInt(month), 0);
+  const endDate = new Date(parseInt(year, 10), parseInt(month, 10), 0); // วันสุดท้ายของเดือน
   const end = formatDate(endDate);
 
-  const sql = `
-  SELECT d.date, j.shift_code, w.title
-  FROM (
-    SELECT DATE_ADD(?, INTERVAL seq DAY) AS date
-    FROM (
-      SELECT @row := @row + 1 AS seq
-      FROM information_schema.columns a,
-           information_schema.columns b,
-           (SELECT @row := -1) r
-      LIMIT 31
-    ) AS days
-    WHERE DATE_ADD(?, INTERVAL seq DAY) <= ?
-  ) d
-  LEFT JOIN job j ON j.date = d.date AND j.user_id = ?
-  LEFT JOIN works w ON d.date BETWEEN w.start_date AND w.end_date
-`;
+  try {
+    const conn = pool.promise();
 
-  pool.query(sql, [start, start, end, userId], (err, results) => {
-    console.log("🔑 Job query:", sql, [start, start, end, userId]);
-    if (err) {
-      console.error("❌ SQL error", err);
-      return res.status(500).json({ message: "DB error" });
-    }
+    // 1) ดึงกะจากตาราง job ของ user นี้ ในช่วงเดือนที่ขอ
+    const [jobRows] = await conn.query(
+      `SELECT date, shift_code
+       FROM job
+       WHERE user_id = ?
+         AND date BETWEEN ? AND ?`,
+      [userId, start, end]
+    );
 
-    // 👇 รวมข้อมูลทั้งหมดไว้ก่อน
+    // 2) ดึงงาน (works) ที่ user นี้เป็นคนสร้างหรือเป็นผู้เกี่ยวข้อง
+    //    และช่วงวันที่ทับซ้อนกับเดือนนี้
+    const [workRows] = await conn.query(
+      `
+  SELECT DISTINCT
+    w.id,
+    w.title,
+    w.start_date,
+    w.end_date
+  FROM works w
+  LEFT JOIN work_users wu ON wu.work_id = w.id
+  WHERE (w.created_by = ? OR wu.user_id = ?)
+    AND w.end_date >= ?
+    AND w.start_date <= ?
+    AND (w.is_closed IS NULL OR w.is_closed = 0)
+  `,
+      [userId, userId, start, end]
+    );
+
+    // 3) เตรียม object grouped[date] = [ { shift_code, title }, ... ]
     const grouped = {};
 
-    for (let d = 1; d <= endDate.getDate(); d++) {
-      const day = new Date(
-        `${year}-${paddedMonth}-${String(d).padStart(2, "0")}`
-      );
+    // เตรียมทุกวันในเดือนไว้ก่อน
+    const lastDay = endDate.getDate();
+    for (let d = 1; d <= lastDay; d++) {
+      const day = new Date(parseInt(year, 10), parseInt(month, 10) - 1, d);
       const dateStr = formatDate(day);
-      grouped[dateStr] = []; // เตรียมทุกวัน
+      grouped[dateStr] = [];
     }
 
-    results.forEach(({ date, shift_code, title }) => {
-      if (!grouped[date]) grouped[date] = [];
-      grouped[date].push({ shift_code, title });
+    // 4) ใส่ job (กะจริง) ลงใน grouped
+    jobRows.forEach((row) => {
+      const dateStr =
+        typeof row.date === "string" ? row.date : formatDate(row.date);
+      if (!grouped[dateStr]) grouped[dateStr] = [];
+      grouped[dateStr].push({
+        shift_code: row.shift_code,
+        title: null, // ยังไม่ผูกกับชื่อ work
+      });
     });
 
-    // 👇 ใส่ A09 ถ้าไม่มี A00 หรือ A15 ในวันทำงาน (จันทร์-ศุกร์)
-    for (let d = 1; d <= endDate.getDate(); d++) {
-      const day = new Date(
-        `${year}-${paddedMonth}-${String(d).padStart(2, "0")}`
-      );
+    // 5) ใส่ works (ขยายช่วงหลายวันเป็นรายวัน) ลงใน grouped
+    workRows.forEach((w) => {
+      const dates = expandDateRange(w.start_date, w.end_date);
+      dates.forEach((dStr) => {
+        // เอาเฉพาะวันที่อยู่ในเดือนนี้
+        if (dStr < start || dStr > end) return;
+        if (!grouped[dStr]) grouped[dStr] = [];
+        grouped[dStr].push({
+          shift_code: null,     // งานนี้อาจไม่มีรหัสกะ
+          title: w.title || "", // ชื่อ work
+        });
+      });
+    });
+
+    // โหลดวันพิเศษทั้งหมด + map เป็น index
+    const [specialRows] = await conn.query(
+      "SELECT date, type FROM special_days"
+    );
+    const specialMap = {};
+    specialRows.forEach((row) => {
+      specialMap[row.date] = row.type; // holiday หรือ workday
+    });
+
+    // 6) เติมกะเริ่มต้น A09 ให้ "วันทำงาน" ที่ไม่มี shift จริงเลย
+    for (let d = 1; d <= lastDay; d++) {
+      const day = new Date(parseInt(year, 10), parseInt(month, 10) - 1, d);
       const dateStr = formatDate(day);
-      const dow = day.getDay();
+      const dow = day.getDay(); // 0=อา,1=จ,...,6=ส
 
-      const shifts = grouped[dateStr] || [];
+      const entries = grouped[dateStr] || [];
 
-      const hasRealShift = shifts.some(
-        (s) =>
-          s.shift_code === "A00" ||
-          s.shift_code === "A15" ||
-          s.shift_code === "A09"
+      const hasRealShift = entries.some((s) =>
+        ["A00", "A09", "A15", "H00", "H09", "H15"].includes(s.shift_code)
       );
 
-      if (dow >= 1 && dow <= 5 && !hasRealShift) {
-        const titleForThatDay =
-          results.find((r) => r.date === dateStr && r.title)?.title || null;
-        grouped[dateStr].push({ shift_code: "A09", title: titleForThatDay });
+      const specialType = specialMap[dateStr];  // holiday / workday / undefined
+
+      const isHolidaySpecial = specialType === "holiday";
+      const isSpecialWorkday = specialType === "workday";
+      const isNormalWeekday = dow >= 1 && dow <= 5; // จ.-ศ. ปกติ
+
+      // ❌ วันหยุดพิเศษ ไม่ต้อง auto A09
+      if (isHolidaySpecial) {
+        continue;
+      }
+
+      // ✅ วันทำงานปกติ หรือวันที่ถูกกำหนดเป็น workday → auto A09 ถ้ายังไม่มี shift จริง
+      if ((isNormalWeekday || isSpecialWorkday) && !hasRealShift) {
+        const firstTitle = entries.find((s) => s.title)?.title || null;
+        entries.unshift({
+          shift_code: "A09",
+          title: firstTitle,
+        });
+        grouped[dateStr] = entries;
       }
     }
 
-    // 👇 สร้าง output array จาก grouped
+
+    // 7) แปลง grouped -> array สำหรับส่งให้ frontend
+    //    1 วันสามารถมีหลายแถวได้ (หลายงานใน 1 วัน)
     const output = [];
-    for (const [date, shifts] of Object.entries(grouped)) {
-      const filtered = shifts.filter((s) => s.shift_code !== null); // ❌ ลบ shift ว่างทิ้ง
-      if (filtered.length === 0) {
+    for (const [date, entries] of Object.entries(grouped)) {
+      if (!entries || entries.length === 0) {
+        // ไม่มีทั้งกะและงาน -> ให้ส่งแถวว่างไป 1 แถว (จะใช้/ไม่ใช้ก็แล้วแต่ฝั่งแอป)
         output.push({ date, shift_code: null, title: null });
       } else {
-        filtered.forEach(({ shift_code, title }) => {
-          output.push({ date, shift_code, title });
+        entries.forEach(({ shift_code, title }) => {
+          output.push({
+            date,
+            shift_code: shift_code || null,
+            title: title || null,
+          });
         });
       }
     }
 
+    // เรียงตามวันที่ก่อนส่งออก (กัน frontend ได้ลำดับแปลก ๆ)
+    output.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+
     res.json(output);
-  });
+  } catch (err) {
+    console.error("❌ /Backend/api/job error:", err);
+    res.status(500).json({ message: "DB error" });
+  }
 });
 
 app.post("/Backend/api/job", authenticateToken, (req, res) => {
@@ -615,16 +728,40 @@ app.post("/Backend/api/job", authenticateToken, (req, res) => {
   );
 });
 
-app.put("/Backend/api/job/:id", authenticateToken, (req, res) => {
-  const { date, shift_code } = req.body;
-  const userId = req.user.id;
+// PUT /Backend/api/job/:id  -> แก้ไขชื่อ, รายละเอียด, กำหนดการ, ผู้เกี่ยวข้อง
+app.put("/Backend/api/job/:id", authenticateToken, async (req, res) => {
   const jobId = req.params.id;
-  const sql =
-    "UPDATE job SET date = ?, shift_code = ? WHERE id = ? AND user_id = ?";
-  pool.query(sql, [date, shift_code, jobId, userId], (err) => {
-    if (err) return res.status(500).json({ message: "Update error" });
-    res.json({ message: "Job updated" });
-  });
+  const { title, description, schedule_text, assigneeIds } = req.body;
+
+  const conn = await pool.promise().getConnection();
+  try {
+    await conn.beginTransaction();
+
+    await conn.query(
+      "UPDATE job SET title = ?, description = ?, schedule_text = ? WHERE id = ?",
+      [title, description, schedule_text, jobId]
+    );
+
+    if (Array.isArray(assigneeIds)) {
+      await conn.query("DELETE FROM job_users WHERE job_id = ?", [jobId]);
+      if (assigneeIds.length > 0) {
+        const values = assigneeIds.map((uid) => [jobId, uid]);
+        await conn.query(
+          "INSERT INTO job_users (job_id, user_id) VALUES ?",
+          [values]
+        );
+      }
+    }
+
+    await conn.commit();
+    res.json({ ok: true });
+  } catch (err) {
+    await conn.rollback();
+    console.error(err);
+    res.status(500).json({ error: "update job failed" });
+  } finally {
+    conn.release();
+  }
 });
 
 app.delete("/Backend/api/job/:id", authenticateToken, (req, res) => {
@@ -636,6 +773,38 @@ app.delete("/Backend/api/job/:id", authenticateToken, (req, res) => {
     res.json({ message: "Job deleted" });
   });
 });
+
+// POST /Backend/api/job/:id/cover  -> อัปโหลดรูปปก
+const uploadimg = multer({ dest: path.join(__dirname, "uploads/job_covers") });
+
+app.post(
+  "/Backend/api/job/:id/cover",
+  authenticateToken,
+  uploadimg.single("cover"),
+  async (req, res) => {
+    const jobId = req.params.id;
+    const file = req.file;
+    if (!file) {
+      return res.status(400).json({ error: "no file" });
+    }
+
+    const relativePath = `/uploads/job_covers/${file.filename}`;
+
+    try {
+      await pool
+        .promise()
+        .query("UPDATE job SET cover_url = ? WHERE id = ?", [
+          relativePath,
+          jobId,
+        ]);
+
+      res.json({ ok: true, cover_url: relativePath });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "update cover failed" });
+    }
+  }
+);
 
 // GET: ดึงรายการวันหยุดพิเศษและวันทำงานพิเศษ
 app.get("/Backend/api/special-days", authenticateToken, (req, res) => {
@@ -1163,13 +1332,13 @@ app.post(
         })),
         video: videoRows.length
           ? {
-              id: videoRows[0].id,
-              url: videoRows[0].video_url,
-              thumbnail_url: videoRows[0].thumbnail_url,
-              duration: videoRows[0].duration,
-              width: videoRows[0].width,
-              height: videoRows[0].height
-            }
+            id: videoRows[0].id,
+            url: videoRows[0].video_url,
+            thumbnail_url: videoRows[0].thumbnail_url,
+            duration: videoRows[0].duration,
+            width: videoRows[0].width,
+            height: videoRows[0].height
+          }
           : null
       };
 
@@ -1636,13 +1805,13 @@ app.put(
         })),
         video: videoRows.length
           ? {
-              id: videoRows[0].id,
-              url: videoRows[0].video_url,
-              thumbnail_url: videoRows[0].thumbnail_url,
-              duration: videoRows[0].duration,
-              width: videoRows[0].width,
-              height: videoRows[0].height
-            }
+            id: videoRows[0].id,
+            url: videoRows[0].video_url,
+            thumbnail_url: videoRows[0].thumbnail_url,
+            duration: videoRows[0].duration,
+            width: videoRows[0].width,
+            height: videoRows[0].height
+          }
           : null
       };
 
@@ -1715,30 +1884,165 @@ app.delete(
   }
 );
 
-// ปิดงาน (soft close) - ไม่ลบจาก DB
-app.put("/Backend/api/works/:id", authenticateToken, (req, res) => {
-  const id = req.params.id;
-  const { is_closed } = req.body || {};
+// อัปเดตงาน (ใช้ได้ทั้งปิดงาน และแก้รายละเอียด)
+app.put("/Backend/api/works/:id", authenticateToken, async (req, res) => {
+  const workId = parseInt(req.params.id, 10);
+  const userId = req.user.id;
 
-  // ถ้าไม่ส่งมา ให้ถือว่า 1 = ปิดงาน
-  const closedFlag = is_closed != null ? Number(is_closed) : 1;
+  if (Number.isNaN(workId)) {
+    return res.status(400).json({ message: "workId ไม่ถูกต้อง" });
+  }
 
-  const sql = "UPDATE works SET is_closed = ? WHERE id = ?";
-  pool.query(sql, [closedFlag, id], (err, result) => {
-    if (err) {
-      log("Error closing work:", err);
-      return res.status(500).json({ message: "Database error" });
+  const {
+    title,
+    type,
+    detail,
+    location,
+    start_date,
+    end_date,
+    related_users,   // array ของ user_id
+    is_closed,
+  } = req.body;
+
+  const conn = await pool.promise().getConnection();
+
+  try {
+    await conn.beginTransaction();
+
+    // โหลดงานและเช็คสิทธิ์
+    const [rows] = await conn.query("SELECT * FROM works WHERE id = ?", [
+      workId,
+    ]);
+    if (!rows.length) {
+      await conn.rollback();
+      return res.status(404).json({ message: "ไม่พบงาน" });
     }
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ message: "Work not found" });
+    const work = rows[0];
+
+    if (work.created_by !== userId) {
+      await conn.rollback();
+      return res
+        .status(403)
+        .json({ message: "คุณไม่มีสิทธิ์แก้ไขงานนี้ (ต้องเป็นคนสร้างงาน)" });
     }
-    res.json({
-      message: "Work closed",
-      id,
-      is_closed: closedFlag
-    });
-  });
+
+    // สร้าง list field ที่จะอัปเดตแบบ dynamic
+    const fields = [];
+    const params = [];
+
+    if (title !== undefined) {
+      fields.push("title = ?");
+      params.push(title);
+    }
+    if (type !== undefined) {
+      fields.push("type = ?");
+      params.push(type);
+    }
+    if (detail !== undefined) {
+      fields.push("detail = ?");
+      params.push(detail);
+    }
+    if (location !== undefined) {
+      fields.push("location = ?");
+      params.push(location);
+    }
+    if (start_date !== undefined) {
+      fields.push("start_date = ?");
+      params.push(start_date || null);
+    }
+    if (end_date !== undefined) {
+      fields.push("end_date = ?");
+      params.push(end_date || null);
+    }
+    if (is_closed !== undefined) {
+      fields.push("is_closed = ?");
+      params.push(is_closed ? 1 : 0);
+    }
+
+    if (fields.length > 0) {
+      params.push(workId);
+      await conn.query(
+        `UPDATE works SET ${fields.join(", ")} WHERE id = ?`,
+        params
+      );
+    }
+
+    // อัปเดตรายชื่อผู้เกี่ยวข้องถ้ามีส่งมา
+    if (Array.isArray(related_users)) {
+      await conn.query("DELETE FROM work_users WHERE work_id = ?", [workId]);
+
+      for (const uid of related_users) {
+        await conn.query(
+          "INSERT INTO work_users (work_id, user_id) VALUES (?, ?)",
+          [workId, uid]
+        );
+      }
+    }
+
+    await conn.commit();
+    res.json({ message: "อัปเดตงานเรียบร้อยแล้ว" });
+  } catch (err) {
+    console.error("❌ PUT /Backend/api/works/:id error:", err);
+    await conn.rollback();
+    res.status(500).json({ message: "DB error" });
+  } finally {
+    conn.release();
+  }
 });
+
+const uploadWorkCover = multer({
+  storage: multer.memoryStorage(),
+});
+
+app.post(
+  "/Backend/api/works/:id/cover",
+  authenticateToken,
+  uploadWorkCover.single("cover"),
+  async (req, res) => {
+    const workId = req.params.id;
+
+    if (!req.file) {
+      return res.status(400).json({ error: "no file" });
+    }
+
+    try {
+      const uploadsDir = path.join(__dirname, "uploads", "work_covers");
+      if (!fs.existsSync(uploadsDir)) {
+        fs.mkdirSync(uploadsDir, { recursive: true });
+      }
+
+      // ---- กำหนดนามสกุลให้แน่นอน ----
+      let ext = path.extname(req.file.originalname || "");
+      if (!ext) {
+        // เดาถ้าขาดนามสกุล
+        if (req.file.mimetype === "image/png") ext = ".png";
+        else ext = ".jpg";
+      }
+
+      const fileName = `${Date.now()}${ext}`;
+      const outPath = path.join(uploadsDir, fileName);
+
+      // เขียนไฟล์ลงดิสก์
+      await fs.promises.writeFile(outPath, req.file.buffer);
+
+      // เก็บ URL แบบเต็ม ใช้ในแอปได้เลย
+      const coverUrl = `https://himtang.com/Backend/uploads/work_covers/${fileName}`;
+
+      await pool
+        .promise()
+        .query("UPDATE works SET image_url = ? WHERE id = ?", [
+          coverUrl,
+          workId,
+        ]);
+
+      res.json({ ok: true, image_url: coverUrl });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "update cover failed" });
+    }
+  }
+);
+
 
 
 
