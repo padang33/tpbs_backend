@@ -2297,6 +2297,29 @@ app.delete(
   }
 );
 
+app.put("/Backend/api/works/:id/restore", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const [result] = await pool
+      .promise()
+      .query(
+        "UPDATE works SET is_closed = 0 WHERE id = ?",
+        [id]
+      );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Work not found" });
+    }
+
+    res.json({ message: "Work restored", id });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+
 
 const PORT = process.env.PORT || 3000;
 pool.getConnection((err, connection) => {
