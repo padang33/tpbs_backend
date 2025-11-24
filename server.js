@@ -29,6 +29,29 @@ function log(...args) {
   console.log(`[${ts}] ${msg}`);
 }
 
+
+// โฟลเดอร์สำหรับเก็บรูปข่าวประกาศ
+const announcementsDir = path.join(__dirname, "uploads", "announcements");
+if (!fs.existsSync(announcementsDir)) {
+  fs.mkdirSync(announcementsDir, { recursive: true });
+}
+
+const announcementStorage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, announcementsDir);
+  },
+  filename: function (req, file, cb) {
+    const ext = path.extname(file.originalname || "");
+    const unique = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    cb(null, "ann-" + unique + ext.toLowerCase());
+  },
+});
+
+const announcementUpload = multer({
+  storage: announcementStorage,
+  limits: { fileSize: 2 * 1024 * 1024 }, // 2MB
+});
+
 // ==== MySQL pool ====
 const pool = mysql.createPool({
   connectionLimit: 10,
@@ -465,6 +488,12 @@ app.use(
   express.static(path.join(__dirname, "uploads", "work_covers"))
 );
 
+// รูปข่าวประกาศ
+app.use(
+  "/Backend/uploads/announcements",
+  express.static(path.join(__dirname, "uploads", "announcements"))
+);
+
 // เสิร์ฟไฟล์ปกงานแบบตรง ๆ รองรับทั้งไฟล์เก่า/ใหม่
 app.get("/Backend/uploads/work_covers/:filename", (req, res) => {
   const filename = req.params.filename;
@@ -475,6 +504,9 @@ app.get("/Backend/uploads/work_covers/:filename", (req, res) => {
   if (fs.existsSync(filePath)) {
     return res.sendFile(filePath);
   }
+
+app.use("/Backend/uploads", express.static(path.join(__dirname, "uploads")));
+
 
   // 2) ถ้าไม่เจอ และชื่อมีจุด → ลองตัดนามสกุล (กรณีไฟล์เก่าที่ไม่มี .jpg/.png)
   const dot = filename.lastIndexOf(".");
@@ -930,15 +962,49 @@ app.get("/Backend/api/works", authenticateToken, async (req, res) => {
     );
 
     for (const work of works) {
+      // ผู้เกี่ยวข้อง
       const [related] = await conn.query(
-        `SELECT u.id, u.firstname, u.lastname FROM work_users wu
+        `SELECT u.id, u.firstname, u.lastname
+         FROM work_users wu
          JOIN users u ON wu.user_id = u.id
          WHERE wu.work_id = ?`,
         [work.id]
       );
       work.related_users = related;
       work.creator_name = `${work.creator_firstname} ${work.creator_lastname}`;
+
+      // เวลาข้อความล่าสุดในงานนี้
+      const [lastRows] = await conn.query(
+        `SELECT MAX(created_at) AS last_msg_at
+         FROM work_messages
+         WHERE work_id = ?`,
+        [work.id]
+      );
+
+      const lastMsgAt = lastRows[0]?.last_msg_at || null;
+
+      // fallback: ถ้าไม่มีแชทเลย ใช้เวลาจากคอลัมน์ใน works แทน
+      const fallback =
+        work.updated_at ||
+        work.created_at ||
+        work.end_date ||
+        work.start_date ||
+        null;
+
+      const lastActivity = lastMsgAt || fallback;
+
+      // เก็บเป็น ISO string (frontend ใช้ได้ง่าย ถ้าอยากใช้)
+      work.last_activity = lastActivity
+        ? new Date(lastActivity).toISOString()
+        : null;
     }
+
+    // เรียงงานตามเวลาเคลื่อนไหวล่าสุด งานที่มีความเปลี่ยนแปลงล่าสุดอยู่บนสุด
+    works.sort((a, b) => {
+      const ta = a.last_activity ? new Date(a.last_activity).getTime() : 0;
+      const tb = b.last_activity ? new Date(b.last_activity).getTime() : 0;
+      return tb - ta;
+    });
 
     res.json(works);
   } catch (err) {
@@ -948,6 +1014,8 @@ app.get("/Backend/api/works", authenticateToken, async (req, res) => {
     conn.release();
   }
 });
+
+
 
 
 app.post("/Backend/api/works", authenticateToken, async (req, res) => {
@@ -1994,57 +2062,240 @@ const uploadWorkCover = multer({
   storage: multer.memoryStorage(),
 });
 
+// ==== ข่าวประกาศ ====
+// POST /Backend/api/announcements  -> เพิ่มข่าวประกาศ (มีรูป/ไม่มีรูปก็ได้)
 app.post(
-  "/Backend/api/works/:id/cover",
+  "/Backend/api/announcements",
   authenticateToken,
-  uploadWorkCover.single("cover"),
+  announcementUpload.single("image"),
   async (req, res) => {
-    const workId = req.params.id;
+    const { title, content, bg_color, start_date, end_date } = req.body;
+    const file = req.file;
 
-    if (!req.file) {
-      return res.status(400).json({ error: "no file" });
+    if (!title || !title.trim()) {
+      return res.status(400).json({ message: "missing title" });
     }
 
+    const filename = file ? file.filename : null;
+
+    const startDate =
+      typeof start_date === "string" && start_date.trim() !== ""
+        ? start_date.trim()
+        : null;
+    const endDate =
+      typeof end_date === "string" && end_date.trim() !== ""
+        ? end_date.trim()
+        : null;
+    const bgColor =
+      typeof bg_color === "string" && bg_color.trim() !== ""
+        ? bg_color.trim()
+        : null;
+
     try {
-      const uploadsDir = path.join(__dirname, "uploads", "work_covers");
-      if (!fs.existsSync(uploadsDir)) {
-        fs.mkdirSync(uploadsDir, { recursive: true });
-      }
+      const conn = pool.promise();
+      const [r] = await conn.query(
+        `
+        INSERT INTO announcements
+          (title, content, bg_color, start_date, end_date, image_url, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        `,
+        [title.trim(), content || "", bgColor, startDate, endDate, filename, req.user.id]
+      );
 
-      // ---- กำหนดนามสกุลให้แน่นอน ----
-      let ext = path.extname(req.file.originalname || "");
-      if (!ext) {
-        // เดาถ้าขาดนามสกุล
-        if (req.file.mimetype === "image/png") ext = ".png";
-        else ext = ".jpg";
-      }
-
-      const fileName = `${Date.now()}${ext}`;
-      const outPath = path.join(uploadsDir, fileName);
-
-      // เขียนไฟล์ลงดิสก์
-      await fs.promises.writeFile(outPath, req.file.buffer);
-
-      // เก็บ URL แบบเต็ม ใช้ในแอปได้เลย
-      const coverUrl = `https://himtang.com/Backend/uploads/work_covers/${fileName}`;
-
-      await pool
-        .promise()
-        .query("UPDATE works SET image_url = ? WHERE id = ?", [
-          coverUrl,
-          workId,
-        ]);
-
-      res.json({ ok: true, image_url: coverUrl });
+      res.json({
+        id: r.insertId,
+        title: title.trim(),
+        content: content || "",
+        bg_color: bgColor,
+        start_date: startDate,
+        end_date: endDate,
+        image_url: filename
+          ? "https://himtang.com/Backend/uploads/announcements/" + filename
+          : null,
+      });
     } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "update cover failed" });
+      console.error("❌ POST /announcements error:", err);
+      res.status(500).json({ message: "DB error" });
     }
   }
 );
 
+// GET /Backend/api/announcements
+// ดึงรายการข่าวประกาศ (รองรับ limit + ฟิลเตอร์ช่วงวัน start/end)
+// ถ้าไม่ส่ง start/end มาเลย → ใช้เงื่อนไข "กำลังประกาศอยู่วันนี้" เหมือนเดิม
+app.get(
+  "/Backend/api/announcements",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const limit = parseInt(req.query.limit || 20, 10);
+      const { start, end } = req.query; // YYYY-MM-DD
 
+      let where = "1=1";
+      const params = [];
 
+      if (start || end) {
+        // filter ตามช่วงวันที่ที่ทับซ้อนกับ start/end ที่ส่งมา
+        if (start) {
+          // ข่าวที่ยังไม่จบก่อนวันที่ start
+          where += " AND (a.end_date IS NULL OR a.end_date >= ?)";
+          params.push(start);
+        }
+        if (end) {
+          // ข่าวที่เริ่มไม่หลังจาก end
+          where += " AND (a.start_date IS NULL OR a.start_date <= ?)";
+          params.push(end);
+        }
+      } else {
+        // โหมดเดิม: เอาเฉพาะที่กำลังประกาศวันนี้
+        where +=
+          " AND (a.start_date IS NULL OR a.start_date <= CURDATE())" +
+          " AND (a.end_date IS NULL OR a.end_date >= CURDATE())";
+      }
+
+      params.push(limit);
+
+      const conn = await pool.promise();
+      const [rows] = await conn.query(
+        `
+        SELECT a.id, a.title, a.content, a.bg_color, a.start_date, a.end_date,
+               a.image_url, a.created_at,
+               u.firstname, u.lastname
+        FROM announcements a
+        JOIN users u ON u.id = a.created_by
+        WHERE ${where}
+        ORDER BY a.created_at DESC
+        LIMIT ?
+        `,
+        params
+      );
+
+      const out = rows.map((r) => ({
+        id: r.id,
+        title: r.title,
+        content: r.content,
+        bg_color: r.bg_color,
+        start_date: r.start_date,
+        end_date: r.end_date,
+        image_url: r.image_url
+          ? "https://himtang.com/Backend/uploads/announcements/" + r.image_url
+          : null,
+        created_at: r.created_at,
+        created_by_name:
+          r.firstname && r.lastname ? `${r.firstname} ${r.lastname}` : null,
+      }));
+
+      res.json(out);
+    } catch (err) {
+      console.error("❌ GET /announcements error:", err);
+      res.status(500).json({ message: "Failed to load announcements" });
+    }
+  }
+);
+
+// GET /Backend/api/announcements/:id
+// ดึงข่าวประกาศทีละอัน (ใช้เปิดดูรายละเอียดเต็ม)
+app.get(
+  "/Backend/api/announcements/:id",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (Number.isNaN(id)) {
+        return res.status(400).json({ message: "Invalid id" });
+      }
+
+      const conn = await pool.promise();
+      const [rows] = await conn.query(
+        `
+        SELECT a.id, a.title, a.content, a.bg_color, a.start_date, a.end_date,
+               a.image_url, a.created_at,
+               u.firstname, u.lastname, a.created_by
+        FROM announcements a
+        JOIN users u ON u.id = a.created_by
+        WHERE a.id = ?
+        `,
+        [id]
+      );
+
+      if (!rows.length) {
+        return res.status(404).json({ message: "Announcement not found" });
+      }
+
+      const r = rows[0];
+      const item = {
+        id: r.id,
+        title: r.title,
+        content: r.content,
+        bg_color: r.bg_color,
+        start_date: r.start_date,
+        end_date: r.end_date,
+        image_url: r.image_url
+          ? "https://himtang.com/Backend/uploads/announcements/" + r.image_url
+          : null,
+        created_at: r.created_at,
+        created_by: r.created_by,
+        created_by_name:
+          r.firstname && r.lastname ? `${r.firstname} ${r.lastname}` : null,
+      };
+
+      res.json(item);
+    } catch (err) {
+      console.error("❌ GET /announcements/:id error:", err);
+      res.status(500).json({ message: "DB error" });
+    }
+  }
+);
+
+// DELETE /Backend/api/announcements/:id
+// ลบข่าว (อนุญาตเฉพาะคนที่เป็นคนสร้าง)
+app.delete(
+  "/Backend/api/announcements/:id",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (Number.isNaN(id)) {
+        return res.status(400).json({ message: "Invalid id" });
+      }
+
+      const conn = await pool.promise();
+
+      // หาเจ้าของ + ชื่อไฟล์รูปเดิม
+      const [rows] = await conn.query(
+        "SELECT image_url, created_by FROM announcements WHERE id = ?",
+        [id]
+      );
+
+      if (!rows.length) {
+        return res.status(404).json({ message: "Announcement not found" });
+      }
+
+      const row = rows[0];
+
+      if (row.created_by !== req.user.id) {
+        return res.status(403).json({ message: "Forbidden" });
+      }
+
+      await conn.query("DELETE FROM announcements WHERE id = ?", [id]);
+
+      // ลบไฟล์รูปออกจากดิสก์ถ้ามี
+      if (row.image_url) {
+        const filePath = path.join(announcementsDir, row.image_url);
+        fs.unlink(filePath, (err) => {
+          if (err && err.code !== "ENOENT") {
+            console.error("❌ delete announcement image error:", err);
+          }
+        });
+      }
+
+      res.json({ message: "Announcement deleted" });
+    } catch (err) {
+      console.error("❌ DELETE /announcements/:id error:", err);
+      res.status(500).json({ message: "DB error" });
+    }
+  }
+);
 
 
 const PORT = process.env.PORT || 3000;
