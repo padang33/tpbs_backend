@@ -29,6 +29,11 @@ function log(...args) {
   console.log(`[${ts}] ${msg}`);
 }
 
+const userImageDir = path.join(__dirname, "UserImage");
+if (!fs.existsSync(userImageDir)) {
+  fs.mkdirSync(userImageDir, { recursive: true });
+}
+
 
 // โฟลเดอร์สำหรับเก็บรูปข่าวประกาศ
 const announcementsDir = path.join(__dirname, "uploads", "announcements");
@@ -279,6 +284,26 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
+// ==== Storage ใหม่ สำหรับอัปโหลดรูปโปรไฟล์ ====
+const profileStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, userImageDir);
+  },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname || ".jpg").toLowerCase();
+    const base = path
+      .basename(file.originalname || "profile", ext)
+      .replace(/\s+/g, "_");
+    const unique = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    cb(null, `${base}-${unique}${ext}`);
+  }
+});
+
+const uploadProfile = multer({
+  storage: profileStorage,
+  limits: { fileSize: 2 * 1024 * 1024 } // 2MB
+});
+
 // ==== Multer config for work chat uploads (images/files/videos) ====
 const chatStorage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -331,31 +356,36 @@ app.get("/Backend/api/me", authenticateToken, (req, res) => {
 });
 
 // POST: Upload profile image
+// POST: Upload profile image
 app.post(
   "/Backend/api/upload-profile",
   authenticateToken,
-  upload.single("image"),
+  uploadProfile.single("image"),
   (req, res) => {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    if (!req.file) {
+      return res.status(400).json({ message: "No file uploaded" });
+    }
+
     console.log("File uploaded:", req.file);
-    // เช็คว่าเป็นไฟล์รูปภาพไหม
-    //console.log('File type:', req.file.mimetype);
-    //console.log('File size:', req.file.size);
-    //console.log('File path:', req.file.path);
-    //console.log('File filename:', req.file.filename);
-    const imageUrl = `https://himtang.com/Backend/UserImage/${req.file.filename}`;
+
+    const filename = req.file.filename;
+    const imageUrl = `https://himtang.com/Backend/UserImage/${filename}`;
     const userId = req.user.id;
 
     pool.query(
       "UPDATE users SET imageUrl = ? WHERE id = ?",
       [imageUrl, userId],
       (err) => {
-        if (err) return res.status(500).json({ message: "Database error" });
+        if (err) {
+          console.error("❌ DB error (upload-profile):", err);
+          return res.status(500).json({ message: "Database error" });
+        }
         res.json({ imageUrl });
       }
     );
   }
 );
+
 
 // POST: Update user profile
 app.post("/Backend/api/update-profile", authenticateToken, (req, res) => {
